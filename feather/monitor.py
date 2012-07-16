@@ -291,7 +291,7 @@ class Monitor(object):
 
         self.pre_worker_fork()
 
-    def fork_worker(self):
+    def fork_worker(self, worker_id=None):
         if not self.is_master:
             self.log.warn("tried to fork a worker from a worker")
             return True
@@ -301,17 +301,18 @@ class Monitor(object):
             os.fchown(tmpfd, self.worker_uid, os.getegid())
 
         pid = os.fork()
+        if worker_id is None:
+            worker_id = len(self.workers)
 
         if pid and self.is_master:
-            self.log.info("worker forked: %d" % pid)
-            self._worker_forked(pid, tmpfd)
+            self._worker_forked(pid, tmpfd, worker_id)
             return False
 
         if self.workers is None:
             self.log.error("forked a worker from a worker, exiting")
             sys.exit(1)
 
-        self._worker_postfork(tmpfd)
+        self._worker_postfork(tmpfd, worker_id)
 
         self.server.serve()
 
@@ -361,19 +362,19 @@ class Monitor(object):
         else:
             self.log.info("feather cluster ready; no notify fifo configured")
 
-    def worker_forked(self):
+    def worker_forked(self, worker_id, pid):
         pass
 
-    def _worker_forked(self, pid, tmpfd):
-        self.log.info("starting health monitor for %d" % pid)
-        self.health_monitor(pid, tmpfd)
-        self.worker_forked()
+    def _worker_forked(self, pid, tmpfd, worker_id):
+        self.log.info("worker forked: pid %d, id %d" % (pid, worker_id))
+        self.health_monitor(pid, tmpfd, worker_id)
+        self.worker_forked(worker_id, pid)
 
-    def worker_postfork(self):
+    def worker_postfork(self, worker_id, pid):
         pass
 
-    def _worker_postfork(self, tmpfd):
-        self.log.info("initializing worker")
+    def _worker_postfork(self, tmpfd, worker_id):
+        self.log.info("initializing worker, id: %s" % worker_id)
 
         if self.worker_uid is not None:
             self.log.info("setting worker uid")
@@ -394,7 +395,7 @@ class Monitor(object):
         self.clear_master_signals()
         self.apply_worker_signals()
 
-        for t in self.workers.values():
+        for t,wid in self.workers.values():
             t.cancel()
         self.workers = None
 
@@ -402,7 +403,7 @@ class Monitor(object):
         self.worker_health_timer(tmpfd)
         self.zombie_checker.cancel()
 
-        self.worker_postfork()
+        self.worker_postfork(worker_id, pid)
 
     def worker_inform_ready(self):
         self.server.ready.wait()
@@ -429,7 +430,10 @@ class Monitor(object):
         for pid in pids:
             os.kill(pid, signum)
 
-    def worker_crashed(self):
+    def worker_crashed(self, worker_id, pid):
+        pass
+
+    def worker_exited(self, worker_id, pid):
         pass
 
     def _worker_exited(self, pid):
@@ -437,13 +441,18 @@ class Monitor(object):
             # this could be another master that was created
             # by a SIGUSR2 handler and then killed off
             return
-        self.workers.pop(pid).cancel()
+        t, worker_id = self.workers.pop(pid)
+        t.cancel()
         if pid in self.do_not_revive:
             self.do_not_revive.discard(pid)
+            self.worker_exited(worker_id, pid)
         else:
-            self.log.fatal("worker %d crashed, starting replacement" % pid)
-            self.worker_crashed()
-            if self.fork_worker():
+            self.log.fatal(
+                "worker %d, id %d crashed, starting replacement" %
+                (pid, worker_id)
+            )
+            self.worker_crashed(worker_id, pid)
+            if self.fork_worker(worker_id=worker_id):
                 return
 
         if self.die_with_last_worker and not self.workers:
@@ -467,15 +476,15 @@ class Monitor(object):
     ## Health Checking
     ##
 
-    def health_monitor(self, pid, tmpfd):
+    def health_monitor(self, pid, tmpfd, worker_id):
         timer = util.Timer(
                 self.WORKER_TIMEOUT,
                 self.health_monitor_check,
-                args=(pid, tmpfd))
+                args=(pid, tmpfd, worker_id))
         timer.start()
-        self.workers[pid] = timer
+        self.workers[pid] = (timer, worker_id)
 
-    def health_monitor_check(self, pid, tmpfd):
+    def health_monitor_check(self, pid, tmpfd, worker_id):
         now = time.time()
         checkin = os.fstat(tmpfd).st_ctime
         if now - checkin > self.WORKER_TIMEOUT:
@@ -488,7 +497,7 @@ class Monitor(object):
             self._worker_exited(pid)
         else:
             self.log.debug("health monitor check passed for %d" % pid)
-            self.health_monitor(pid, tmpfd)
+            self.health_monitor(pid, tmpfd, worker_id)
 
     def worker_health_timer(self, tmpfd):
         timer = util.Timer(
