@@ -49,6 +49,23 @@ class Monitor(object):
             group = grp.getgrnam(group)[2]
         self.worker_gid = group
 
+    def _create_pidfile(self, filename, pid):
+        ''' creates a temp file for write '''
+        pidfd = open("/var/run/feather/%s.pid" % filename, "w")
+        pidfd.write("%s\n" % pid)
+        pidfd.flush()
+        pidfd.close()
+
+    def _remove_tempfile(self, filepath):
+        ''' remove a tempfile. Do not raise if it doesn't exist.'''
+        try:
+            os.remove(filepath)
+        except OSError, e:
+            if e.errno == errno.ENOENT:
+                pass
+            else:
+                raise e
+
     @property
     def log(self):
         if self.is_master:
@@ -64,6 +81,12 @@ class Monitor(object):
         self._pre_worker_fork()
         self.fork_workers()
         if self.is_master:
+            if not os.path.exists("/var/run/feather"):
+                os.mkdir("/var/run/feather")
+                os.chown("/var/run/feather", self.worker_uid, self.worker_gid)
+                od.chmod("/var/run/feather", 0775)
+
+            self._create_pidfile("monitor_master", self.master_pid)
             self._post_worker_fork()
 
         self.done.wait()
@@ -367,6 +390,7 @@ class Monitor(object):
 
     def _worker_forked(self, pid, tmpfd, worker_id):
         self.log.info("worker forked: pid %d, id %d" % (pid, worker_id))
+        self._create_pidfile("monitor_worker_%s" % worker_id, pid)
         self.health_monitor(pid, tmpfd, worker_id)
         self.worker_forked(worker_id, pid)
 
@@ -443,6 +467,11 @@ class Monitor(object):
             return
         t, worker_id = self.workers.pop(pid)
         t.cancel()
+
+        self._remove_tempfile(
+            "/var/run/feather/monitor_worker_%s.pid" % worker_id
+        )
+
         if pid in self.do_not_revive:
             self.do_not_revive.discard(pid)
             self.worker_exited(worker_id, pid)
@@ -457,6 +486,7 @@ class Monitor(object):
 
         if self.die_with_last_worker and not self.workers:
             self.log.info("last worker done, exiting")
+            self._remove_tempfile("/var/run/feather/monitor_master.pid")
             self.done.set()
 
     ##
