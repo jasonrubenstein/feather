@@ -335,7 +335,7 @@ class Monitor(object):
             self.log.error("forked a worker from a worker, exiting")
             sys.exit(1)
 
-        self._worker_postfork(tmpfd, worker_id)
+        self._worker_postfork(tmpfd, worker_id, pid)
 
         self.server.serve()
 
@@ -397,7 +397,7 @@ class Monitor(object):
     def worker_postfork(self, worker_id, pid):
         pass
 
-    def _worker_postfork(self, tmpfd, worker_id):
+    def _worker_postfork(self, tmpfd, worker_id, pid):
         self.log.info("initializing worker, id: %s" % worker_id)
 
         if self.worker_uid is not None:
