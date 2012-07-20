@@ -26,7 +26,8 @@ class Monitor(object):
     ZOMBIE_CHECK_INTERVAL = 2.0
 
     def __init__(self, server, worker_count, user=None, group=None,
-            notify_fifo=None):
+            notify_fifo=None, management_dir=None, master_pidfile=None,
+            worker_pidfile=None):
         self.server = server
         self.count = worker_count
         self.notify_fifo = notify_fifo
@@ -38,6 +39,9 @@ class Monitor(object):
         self.zombie_checker = None
         self.readiness_notifier = None
         self.original = True
+        self.management_dir = management_dir or '/var/run/feather'
+        self.master_pidfile = master_pidfile or 'monitor_master'
+        self.worker_pidfile = worker_pidfile or "monitor_worker_%d"
 
         # if the user or group name is not a valid one,
         # just let that exception propogate up
@@ -49,21 +53,17 @@ class Monitor(object):
             group = grp.getgrnam(group)[2]
         self.worker_gid = group
 
-    def _create_pidfile(self, filename, pid):
-        ''' creates a temp file for write '''
-        pidfd = open("/var/run/feather/%s.pid" % filename, "w")
-        pidfd.write("%s\n" % pid)
-        pidfd.flush()
-        pidfd.close()
+    def create_pidfile(self, filename, pid):
+        with open("%s/%s.pid" % (self.management_dir, filename), "w") as pidfd:
+            pidfd.write("%s\n" % pid)
+            pidfd.flush()
+            pidfd.close()
 
-    def _remove_tempfile(self, filepath):
-        ''' remove a tempfile. Do not raise if it doesn't exist.'''
+    def remove_tempfile(self, filepath):
         try:
             os.remove(filepath)
         except OSError, e:
-            if e.errno == errno.ENOENT:
-                pass
-            else:
+            if e.errno != errno.ENOENT:
                 raise e
 
     @property
@@ -81,12 +81,6 @@ class Monitor(object):
         self._pre_worker_fork()
         self.fork_workers()
         if self.is_master:
-            if not os.path.exists("/var/run/feather"):
-                os.mkdir("/var/run/feather")
-                os.chown("/var/run/feather", self.worker_uid, self.worker_gid)
-                od.chmod("/var/run/feather", 0775)
-
-            self._create_pidfile("monitor_master", self.master_pid)
             self._post_worker_fork()
 
         self.done.wait()
@@ -304,6 +298,13 @@ class Monitor(object):
                 os.getegid() not in (0, self.worker_gid)):
             raise RuntimeError("workers can't setgid from non-root")
 
+        try:
+            os.mkdir(self.management_dir)
+        except OSError, e:
+            if e.errno != errno.EEXIST:
+                raise e
+
+        tempfile.tempdir = self.management_dir
         self.ready_r, self.ready_w = io.pipe()
         self.ready_lockfd, lockfile = tempfile.mkstemp()
 
@@ -312,9 +313,14 @@ class Monitor(object):
         self.server.setup()
         self.zombie_monitor()
 
+        if self.worker_uid is not None and self.worker_gid is not None:
+            os.chown(self.management_dir, self.worker_uid, self.worker_gid)
+            os.chmod(self.management_dir, 0775)
+        self.create_pidfile(self.master_pidfile, self.master_pid)
+
         self.pre_worker_fork()
 
-    def fork_worker(self, worker_id=None):
+    def fork_worker(self, worker_id):
         if not self.is_master:
             self.log.warn("tried to fork a worker from a worker")
             return True
@@ -324,10 +330,9 @@ class Monitor(object):
             os.fchown(tmpfd, self.worker_uid, os.getegid())
 
         pid = os.fork()
-        if worker_id is None:
-            worker_id = len(self.workers)
 
         if pid and self.is_master:
+            self.log.info("worker forked: %d, id %d" % (pid, worker_id))
             self._worker_forked(pid, tmpfd, worker_id)
             return False
 
@@ -342,7 +347,7 @@ class Monitor(object):
     def fork_workers(self):
         self.log.info("forking %d workers" % (self.count - len(self.workers)))
         for i in xrange(self.count - len(self.workers)):
-            if self.fork_worker():
+            if self.fork_worker(len(self.workers)):
                 break
 
     def _post_worker_fork(self):
@@ -389,8 +394,9 @@ class Monitor(object):
         pass
 
     def _worker_forked(self, pid, tmpfd, worker_id):
-        self.log.info("worker forked: pid %d, id %d" % (pid, worker_id))
-        self._create_pidfile("monitor_worker_%s" % worker_id, pid)
+        self.log.info(
+            "starting health monitor for %d, id %d" % (pid, worker_id)
+        )
         self.health_monitor(pid, tmpfd, worker_id)
         self.worker_forked(worker_id, pid)
 
@@ -400,13 +406,13 @@ class Monitor(object):
     def _worker_postfork(self, tmpfd, worker_id, pid):
         self.log.info("initializing worker, id: %s" % worker_id)
 
-        if self.worker_uid is not None:
-            self.log.info("setting worker uid")
-            os.setuid(self.worker_uid)
-
         if self.worker_gid is not None:
             self.log.info("setting worker gid")
             os.setgid(self.worker_gid)
+
+        if self.worker_uid is not None:
+            self.log.info("setting worker uid")
+            os.setuid(self.worker_uid)
 
         if self.readiness_notifier is not None:
             scheduler.end(self.readiness_notifier)
@@ -427,6 +433,7 @@ class Monitor(object):
         self.worker_health_timer(tmpfd)
         self.zombie_checker.cancel()
 
+        self.create_pidfile(self.worker_pidfile % worker_id, pid)
         self.worker_postfork(worker_id, pid)
 
     def worker_inform_ready(self):
@@ -468,8 +475,9 @@ class Monitor(object):
         t, worker_id = self.workers.pop(pid)
         t.cancel()
 
-        self._remove_tempfile(
-            "/var/run/feather/monitor_worker_%s.pid" % worker_id
+        pidfile = self.worker_pidfile % worker_id
+        self.remove_tempfile(
+            "%s/%s.pid" % (self.management_dir, pidfile)
         )
 
         if pid in self.do_not_revive:
@@ -486,7 +494,13 @@ class Monitor(object):
 
         if self.die_with_last_worker and not self.workers:
             self.log.info("last worker done, exiting")
-            self._remove_tempfile("/var/run/feather/monitor_master.pid")
+            for f in os.listdir(self.management_dir):
+                try:
+                    os.remove(os.path.join(self.management_dir, f))
+                except OSError, e:
+                    if e.errno != errno.ENOENT:
+                        raise e
+
             self.done.set()
 
     ##

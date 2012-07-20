@@ -36,7 +36,8 @@ def main():
             traceback_body=True,
             keepalive_timeout=1)
 
-    mon = monitor.Monitor(server, 5, notify_fifo='/tmp/feather-ready')
+    mon = monitor.Monitor(server, 5, notify_fifo='/tmp/feather-ready',
+                          management_dir="./tmp")
 
     mon.serve()
 
