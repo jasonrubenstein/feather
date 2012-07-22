@@ -80,6 +80,10 @@ class Monitor(object):
             return master_log
         return worker_log
 
+    @property
+    def pids(self):
+        return [pid for (timer, pid) in self.workers.values()]
+
     ##
     ## Main Entry Point
     ##
@@ -172,7 +176,7 @@ class Monitor(object):
     def master_sigquit(self):
         # gracefully shutdown workers, then exit
         self.log.info("SIGQUIT received. gracefully shutting down")
-        self.do_not_revive.update(self.workers.keys())
+        self.do_not_revive.update(self.pids)
         self.die_with_last_worker = True
         if not self.workers:
             self.log.info("last worker done, exiting")
@@ -188,7 +192,7 @@ class Monitor(object):
             return
         self.log.info(
                 "SIGWINCH received. gracefully closing workers")
-        self.do_not_revive.update(self.workers.keys())
+        self.do_not_revive.update(self.pids)
         self.die_with_last_worker = False
         self.signal_workers(signal.SIGQUIT)
 
@@ -197,7 +201,7 @@ class Monitor(object):
         self.log.info("SIGHUP received. bouncing workers")
         self.die_with_last_worker = False
 
-        workers = self.workers.keys()
+        workers = self.pids
 
         self.fork_workers()
 
@@ -207,7 +211,7 @@ class Monitor(object):
         # immediately kill workers, then exit
         self.log.info(
                 "SIGINT/TERM received. killing workers and exiting")
-        self.do_not_revive.update(self.workers.keys())
+        self.do_not_revive.update(self.pids)
         self.die_with_last_worker = True
         if not self.workers:
             self.log.info("last worker done, exiting")
@@ -218,7 +222,7 @@ class Monitor(object):
         # increment workers
         self.log.info("SIGTTIN received. incrementing worker count")
         self.count += 1
-        self.fork_workers(max(self.workers) + 1)
+        self.fork_workers(max(self.pids) + 1)
 
     def master_sigttou(self):
         # decrement workers
@@ -226,7 +230,7 @@ class Monitor(object):
                 "SIGTTOU received. gracefully closing one worker")
         self.count -= 1
 
-        lucky = max(self.workers)
+        lucky = max(self.pids)
         self.do_not_revive.add(lucky)
         os.kill(lucky, signal.SIGQUIT)
 
@@ -348,14 +352,14 @@ class Monitor(object):
             self.log.error("forked a worker from a worker, exiting")
             sys.exit(1)
 
-        self._worker_postfork(tmpfd, worker_id, pid)
+        self._worker_postfork(tmpfd, worker_id)
 
         self.server.serve()
 
     def fork_workers(self):
         self.log.info("forking %d workers" % (self.count - len(self.workers)))
         for i in xrange(self.count - len(self.workers)):
-            if self.fork_worker(max(self.workers) + 1 if self.workers else 0):
+            if self.fork_worker(max(self.pids) + 1 if self.pids else 0):
                 break
 
     def _post_worker_fork(self):
@@ -364,7 +368,7 @@ class Monitor(object):
         scheduler.schedule(self.readiness_notifier)
 
     def notify_readiness(self):
-        pids = set(self.workers.keys())
+        pids = set(self.pids)
 
         while pids:
             pid = struct.unpack("!I", self.ready_r.read(4))[0]
@@ -413,8 +417,9 @@ class Monitor(object):
     def worker_postfork(self, worker_id, pid):
         pass
 
-    def _worker_postfork(self, tmpfd, worker_id, pid):
-        self.log.info("initializing worker, id: %s" % worker_id)
+    def _worker_postfork(self, tmpfd, worker_id):
+        pid = os.getpid()
+        self.log.info("initializing worker %s, id: %s" % (pid, worker_id))
 
         if self.worker_gid is not None:
             self.log.info("setting worker gid")
@@ -466,7 +471,7 @@ class Monitor(object):
         if not self.is_master:
             self.log.warn("tried signaling workers from a worker")
             return
-        pids = pids or self.workers.keys()
+        pids = pids or self.pids
         self.log.info("signaling all %d workers with %d" % (len(pids), signum))
 
         for pid in pids:
@@ -479,7 +484,7 @@ class Monitor(object):
         pass
 
     def _worker_exited(self, pid):
-        if pid not in self.workers:
+        if pid not in self.pids:
             # this could be another master that was created
             # by a SIGUSR2 handler and then killed off
             return
