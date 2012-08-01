@@ -59,14 +59,14 @@ class Monitor(object):
             group = grp.getgrnam(group)[2]
         self.worker_gid = group
 
-    def create_pidfile(self, filename, pid):
+    def create_management_file(self, filename, pid):
         self.log.info("creating pidfile for %s" % pid)
         with open(os.path.join(self.management_dir, filename), "w") as pidfd:
             pidfd.write("%s\n" % pid)
             pidfd.flush()
             pidfd.close()
 
-    def remove_tempfile(self, filepath):
+    def remove_management_file(self, filepath):
         filepath = os.path.join(self.management_dir, filepath)
         self.log.info("removing file %s" % filepath)
         try:
@@ -326,7 +326,7 @@ class Monitor(object):
             os.chown(self.management_dir, self.worker_uid, self.worker_gid)
         os.chmod(self.management_dir, 0775)
         if self.master_pidfile:
-            self.create_pidfile(self.master_pidfile, self.master_pid)
+            self.create_management_file(self.master_pidfile, self.master_pid)
 
         self.ready_r, self.ready_w = io.pipe()
         self.ready_lockfd, lockfile = tempfile.mkstemp(dir=self.management_dir)
@@ -455,7 +455,7 @@ class Monitor(object):
         self.zombie_checker.cancel()
 
         if self.worker_pidfile:
-            self.create_pidfile(self.worker_pidfile % worker_id, pid)
+            self.create_management_file(self.worker_pidfile % worker_id, pid)
         self.worker_postfork(worker_id, pid)
 
     def worker_inform_ready(self):
@@ -500,7 +500,7 @@ class Monitor(object):
 
         if self.worker_pidfile:
             pidfile = self.worker_pidfile % worker_id
-            self.remove_tempfile(pidfile)
+            self.remove_management_file(pidfile)
 
         if pid in self.do_not_revive:
             self.do_not_revive.discard(pid)
