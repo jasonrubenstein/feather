@@ -39,9 +39,15 @@ class Monitor(object):
         self.zombie_checker = None
         self.readiness_notifier = None
         self.original = True
-        self.management_dir = management_dir or '/var/run/feather'
-        self.master_pidfile = master_pidfile or 'monitor_master'
-        self.worker_pidfile = worker_pidfile or "monitor_worker_%d"
+        self.management_dir = management_dir
+        self.master_pidfile = master_pidfile
+        self.worker_pidfile = worker_pidfile
+
+        if any((self.notify_fifo,
+               self.master_pidfile,
+               self.worker_pidfile)) and self.management_dir is None:
+            raise RuntimeError(
+                "Management directory not specified, required for files")
 
         # if the user or group name is not a valid one,
         # just let that exception propogate up
@@ -54,17 +60,19 @@ class Monitor(object):
         self.worker_gid = group
 
     def create_pidfile(self, filename, pid):
+        self.log.info("creating pidfile for %s" % pid)
         with open("%s/%s.pid" % (self.management_dir, filename), "w") as pidfd:
             pidfd.write("%s\n" % pid)
             pidfd.flush()
             pidfd.close()
 
     def remove_tempfile(self, filepath):
+        self.log.info("removing file %s" % filepath)
         try:
             os.remove(filepath)
         except OSError, e:
             if e.errno != errno.ENOENT:
-                raise e
+                raise
 
     @property
     def log(self):
@@ -210,7 +218,7 @@ class Monitor(object):
         # increment workers
         self.log.info("SIGTTIN received. incrementing worker count")
         self.count += 1
-        self.fork_workers()
+        self.fork_workers(max(self.workers) + 1)
 
     def master_sigttou(self):
         # decrement workers
@@ -218,7 +226,7 @@ class Monitor(object):
                 "SIGTTOU received. gracefully closing one worker")
         self.count -= 1
 
-        lucky = sorted(self.workers.keys())[0]
+        lucky = max(self.workers)
         self.do_not_revive.add(lucky)
         os.kill(lucky, signal.SIGQUIT)
 
@@ -302,21 +310,21 @@ class Monitor(object):
             os.mkdir(self.management_dir)
         except OSError, e:
             if e.errno != errno.EEXIST:
-                raise e
+                raise
 
-        tempfile.tempdir = self.management_dir
+        if self.worker_uid is not None and self.worker_gid is not None:
+            os.chown(self.management_dir, self.worker_uid, self.worker_gid)
+        os.chmod(self.management_dir, 0775)
+        if self.master_pidfile:
+            self.create_pidfile(self.master_pidfile, self.master_pid)
+
         self.ready_r, self.ready_w = io.pipe()
-        self.ready_lockfd, lockfile = tempfile.mkstemp()
+        self.ready_lockfd, lockfile = tempfile.mkstemp(dir=self.management_dir)
 
         self.apply_master_signals()
         self.server.worker_count = 1
         self.server.setup()
         self.zombie_monitor()
-
-        if self.worker_uid is not None and self.worker_gid is not None:
-            os.chown(self.management_dir, self.worker_uid, self.worker_gid)
-            os.chmod(self.management_dir, 0775)
-        self.create_pidfile(self.master_pidfile, self.master_pid)
 
         self.pre_worker_fork()
 
@@ -325,7 +333,7 @@ class Monitor(object):
             self.log.warn("tried to fork a worker from a worker")
             return True
 
-        tmpfd, tmpfname = tempfile.mkstemp()
+        tmpfd, tmpfname = tempfile.mkstemp(dir=self.management_dir)
         if self.worker_uid is not None:
             os.fchown(tmpfd, self.worker_uid, os.getegid())
 
@@ -347,7 +355,7 @@ class Monitor(object):
     def fork_workers(self):
         self.log.info("forking %d workers" % (self.count - len(self.workers)))
         for i in xrange(self.count - len(self.workers)):
-            if self.fork_worker(len(self.workers)):
+            if self.fork_worker(max(self.workers) + 1 if self.workers else 0):
                 break
 
     def _post_worker_fork(self):
@@ -370,8 +378,10 @@ class Monitor(object):
                     (pid, len(pids)))
 
         if self.notify_fifo:
+            notify_fifo_path = os.path.join(self.management_dir,
+                                            self.notify_fifo)
             try:
-                os.mknod(self.notify_fifo, 0644, stat.S_IFIFO)
+                os.mknod(notify_fifo_path, 0644, stat.S_IFIFO)
             except EnvironmentError, exc:
                 if exc.args[0] != errno.EEXIST:
                     raise
@@ -380,7 +390,7 @@ class Monitor(object):
             self.log.info("notifying of readiness at %s" % self.notify_fifo)
 
             try:
-                with io.File(self.notify_fifo, 'a') as fp:
+                with io.File(notify_fifo_path, 'a') as fp:
                     fp.write('\x00')
             except EnvironmentError, exc:
                 self.log.warn("feather cluster ready; " +
@@ -433,7 +443,8 @@ class Monitor(object):
         self.worker_health_timer(tmpfd)
         self.zombie_checker.cancel()
 
-        self.create_pidfile(self.worker_pidfile % worker_id, pid)
+        if self.worker_pidfile:
+            self.create_pidfile(self.worker_pidfile % worker_id, pid)
         self.worker_postfork(worker_id, pid)
 
     def worker_inform_ready(self):
@@ -475,10 +486,11 @@ class Monitor(object):
         t, worker_id = self.workers.pop(pid)
         t.cancel()
 
-        pidfile = self.worker_pidfile % worker_id
-        self.remove_tempfile(
-            "%s/%s.pid" % (self.management_dir, pidfile)
-        )
+        if self.worker_pidfile:
+            pidfile = self.worker_pidfile % worker_id
+            self.remove_tempfile(
+                "%s/%s.pid" % (self.management_dir, pidfile)
+            )
 
         if pid in self.do_not_revive:
             self.do_not_revive.discard(pid)
@@ -499,7 +511,7 @@ class Monitor(object):
                     os.remove(os.path.join(self.management_dir, f))
                 except OSError, e:
                     if e.errno != errno.ENOENT:
-                        raise e
+                        raise
 
             self.done.set()
 
