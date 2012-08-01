@@ -61,12 +61,13 @@ class Monitor(object):
 
     def create_pidfile(self, filename, pid):
         self.log.info("creating pidfile for %s" % pid)
-        with open("%s/%s.pid" % (self.management_dir, filename), "w") as pidfd:
+        with open(os.path.join(self.management_dir, filename), "w") as pidfd:
             pidfd.write("%s\n" % pid)
             pidfd.flush()
             pidfd.close()
 
     def remove_tempfile(self, filepath):
+        filepath = os.path.join(self.management_dir, filepath)
         self.log.info("removing file %s" % filepath)
         try:
             os.remove(filepath)
@@ -445,7 +446,7 @@ class Monitor(object):
         self.clear_master_signals()
         self.apply_worker_signals()
 
-        for t,wid in self.workers.values():
+        for t,worker_id in self.workers.values():
             t.cancel()
         self.workers = None
 
@@ -499,9 +500,7 @@ class Monitor(object):
 
         if self.worker_pidfile:
             pidfile = self.worker_pidfile % worker_id
-            self.remove_tempfile(
-                "%s/%s.pid" % (self.management_dir, pidfile)
-            )
+            self.remove_tempfile(pidfile)
 
         if pid in self.do_not_revive:
             self.do_not_revive.discard(pid)
