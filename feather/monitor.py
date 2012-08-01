@@ -207,11 +207,9 @@ class Monitor(object):
         self.log.info("SIGHUP received. bouncing workers")
         self.die_with_last_worker = False
 
-        workers = self.pids
-
         self.fork_workers()
 
-        self.signal_workers(signal.SIGQUIT, pids=workers)
+        self.signal_workers(signal.SIGQUIT, pids=self.pids)
 
     def master_sigint(self):
         # immediately kill workers, then exit
@@ -446,7 +444,7 @@ class Monitor(object):
         self.clear_master_signals()
         self.apply_worker_signals()
 
-        for t,worker_id in self.workers.values():
+        for t,_worker_id in self.workers.values():
             t.cancel()
         self.workers = None
 
