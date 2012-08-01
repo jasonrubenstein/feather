@@ -82,7 +82,12 @@ class Monitor(object):
 
     @property
     def pids(self):
-        return [pid for (timer, pid) in self.workers.values()]
+        if self.workers is None:
+            return {}
+        return dict([(pid, worker_id)
+                     for (worker_id, (timer, pid))
+                     in self.workers.iteritems()]
+        )
 
     ##
     ## Main Entry Point
@@ -222,7 +227,7 @@ class Monitor(object):
         # increment workers
         self.log.info("SIGTTIN received. incrementing worker count")
         self.count += 1
-        self.fork_workers(max(self.pids) + 1)
+        self.fork_worker(max(self.workers) + 1)
 
     def master_sigttou(self):
         # decrement workers
@@ -359,7 +364,7 @@ class Monitor(object):
     def fork_workers(self):
         self.log.info("forking %d workers" % (self.count - len(self.workers)))
         for i in xrange(self.count - len(self.workers)):
-            if self.fork_worker(max(self.pids) + 1 if self.pids else 0):
+            if self.fork_worker(max(self.workers) + 1 if self.workers else 0):
                 break
 
     def _post_worker_fork(self):
@@ -488,7 +493,8 @@ class Monitor(object):
             # this could be another master that was created
             # by a SIGUSR2 handler and then killed off
             return
-        t, worker_id = self.workers.pop(pid)
+        worker_id = self.pids[pid]
+        t, _pid = self.workers.pop(worker_id)
         t.cancel()
 
         if self.worker_pidfile:
@@ -543,7 +549,7 @@ class Monitor(object):
                 self.health_monitor_check,
                 args=(pid, tmpfd, worker_id))
         timer.start()
-        self.workers[pid] = (timer, worker_id)
+        self.workers[worker_id] = (timer, pid)
 
     def health_monitor_check(self, pid, tmpfd, worker_id):
         now = time.time()
